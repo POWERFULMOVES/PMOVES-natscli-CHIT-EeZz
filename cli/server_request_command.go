@@ -24,6 +24,7 @@ import (
 	"github.com/nats-io/jsm.go/serverdata"
 	"github.com/nats-io/natscli/options"
 
+	"github.com/nats-io/jsm.go/api/server/zmonitor"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 
@@ -66,8 +67,9 @@ type SrvRequestCmd struct {
 
 	nc *nats.Conn
 
-	jsServerOnly bool
-	jsEnabled    bool
+	jsServerOnly         bool
+	jsEnabled            bool
+	leafRemotesConnected bool
 
 	archivePath string
 
@@ -130,6 +132,7 @@ func configureServerRequestCommand(srv *fisk.CmdClause) {
 	healthz.Arg("wait", "Wait for a certain number of responses").Uint32Var(&c.waitFor)
 	healthz.Flag("js-enabled", "Checks that JetStream should be enabled on all servers").Short('J').BoolVar(&c.jsEnabled)
 	healthz.Flag("server-only", "Restricts the health check to the JetStream server only, do not check streams and consumers").Short('S').BoolVar(&c.jsServerOnly)
+	healthz.Flag("leaf-remotes-connected", "Checks that all enabled Leafnode remotes are connected").BoolVar(&c.leafRemotesConnected)
 	healthz.Flag("account", "Check only a specific Account").StringVar(&c.account)
 	healthz.Flag("stream", "Check only a specific Stream").StringVar(&c.stream)
 	healthz.Flag("consumer", "Check only a specific Consumer").StringVar(&c.consumer)
@@ -225,7 +228,7 @@ func (c *SrvRequestCmd) dataSource() (serverdata.Source, error) {
 		if c.host != "" || c.name != "" {
 			waitFor = 1
 		} else {
-			w, _ := serverdata.CurrentActiveServers(ctx, nc, opts().Timeout, traceLogger())
+			w, _ := serverdata.CurrentActiveServers(ctx, nc, c.reqFilter().Domain, opts().Timeout, traceLogger())
 			waitFor = uint32(w)
 		}
 	}
@@ -343,7 +346,7 @@ func (c *SrvRequestCmd) profilez(_ *fisk.ParseContext) error {
 	}
 
 	if len(responses) == 0 && c.archivePath != "" {
-		fmt.Fprintf(os.Stderr, "no captured profiles matched %q at level %d in %s; audit gather typically captures goroutine at level 1 and 2\n", c.profileName, c.profileDebug, c.archivePath)
+		fmt.Fprintf(os.Stderr, "no captured profiles matched %q at level %d in %s\n", c.profileName, c.profileDebug, c.archivePath)
 	}
 
 	prefix := fmt.Sprintf("%s-%s-", c.profileName, time.Now().Format("20060102-150405"))
@@ -394,17 +397,15 @@ func (c *SrvRequestCmd) healthz(_ *fisk.ParseContext) error {
 	}
 	defer src.Close()
 
-	responses, err := src.Healthz(server.HealthzEventOptions{
-		HealthzOptions: server.HealthzOptions{
-			JSEnabledOnly: c.jsEnabled,
-			JSServerOnly:  c.jsServerOnly,
-			Details:       c.includeDetails,
-			Account:       c.account,
-			Stream:        c.stream,
-			Consumer:      c.consumer,
-		},
-		EventFilterOptions: c.reqFilter(),
-	})
+	responses, err := src.Healthz(zmonitor.HealthzOptionsV1{
+		JSEnabledOnly:        c.jsEnabled,
+		JSServerOnly:         c.jsServerOnly,
+		LeafRemotesConnected: c.leafRemotesConnected,
+		Details:              c.includeDetails,
+		Account:              c.account,
+		Stream:               c.stream,
+		Consumer:             c.consumer,
+	}, c.reqFilter())
 	if err != nil {
 		return err
 	}

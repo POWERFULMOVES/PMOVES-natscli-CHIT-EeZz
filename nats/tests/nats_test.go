@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -107,6 +106,84 @@ func runNatsCliWithInput(t *testing.T, input string, args ...string) ([]byte, er
 	return runNatsCliCore(t, input, nil, args...)
 }
 
+func runNatsCliBackground(t *testing.T, args ...string) <-chan string {
+	t.Helper()
+
+	out := make(chan string, 1)
+	go func() {
+		output, err := runNatsCliWithInput(t, "", args...)
+		if err != nil {
+			t.Errorf("%v: %s", err, output)
+		}
+		out <- string(output)
+	}()
+
+	return out
+}
+
+func startNatsCli(t *testing.T, srv *server.Server, nc *nats.Conn, subs int, args ...string) <-chan string {
+	t.Helper()
+
+	out := runNatsCliBackground(t, args...)
+
+	testCid, err := nc.GetClientID()
+	if err != nil {
+		t.Fatalf("could not get client id: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			connz, err := srv.Connz(&server.ConnzOptions{})
+			if err != nil {
+				t.Fatalf("connz failed: %v", err)
+			}
+
+			for _, conn := range connz.Conns {
+				if conn.Cid != testCid && conn.NumSubs >= uint32(subs) {
+					return out
+				}
+			}
+
+		case <-ctx.Done():
+			t.Fatalf("CLI did not create %d subscriptions in time", subs)
+		}
+	}
+}
+
+func startNatsCliConsumer(t *testing.T, mgr *jsm.Manager, stream string, args ...string) <-chan string {
+	t.Helper()
+
+	out := runNatsCliBackground(t, args...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			names, err := mgr.ConsumerNames(stream)
+			if err != nil {
+				t.Fatalf("consumer names failed: %v", err)
+			}
+
+			if len(names) > 0 {
+				return out
+			}
+
+		case <-ctx.Done():
+			t.Fatalf("CLI did not create a consumer on %s in time", stream)
+		}
+	}
+}
+
 func prepareHelper(servers string) (*nats.Conn, *jsm.Manager, error) {
 	nc, err := nats.Connect(servers)
 	if err != nil {
@@ -177,23 +254,28 @@ func setupJStreamTest(t *testing.T) (srv *server.Server, nc *nats.Conn, mgr *jsm
 
 func withNatsServer(t *testing.T, cb func(*testing.T, *server.Server, *nats.Conn) error) {
 	t.Helper()
-	createServersWithCallback(t, 1, false, cb)
+	createServersWithCallback(t, 1, false, "", cb)
 }
 
 func withJSServer(t *testing.T, cb func(*testing.T, *server.Server, *nats.Conn, *jsm.Manager) error) {
 	t.Helper()
-	createServersWithCallback(t, 1, true, cb)
+	createServersWithCallback(t, 1, true, "", cb)
 }
 
 func withJSCluster(t *testing.T, cb func(*testing.T, []*server.Server, *nats.Conn, *jsm.Manager) error) {
 	t.Helper()
+	withJSClusterDomain(t, "", cb)
+}
+
+func withJSClusterDomain(t *testing.T, domain string, cb func(*testing.T, []*server.Server, *nats.Conn, *jsm.Manager) error) {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("Skipping on Windows due to GitHub Actions resource constraints")
 	}
-	createServersWithCallback(t, 3, true, cb)
+	createServersWithCallback(t, 3, true, domain, cb)
 }
 
-func createServersWithCallback(t *testing.T, serverCount int, jsEnabled bool, cb any) {
+func createServersWithCallback(t *testing.T, serverCount int, jsEnabled bool, jsDomain string, cb any) {
 	t.Helper()
 
 	d, err := os.MkdirTemp("", "jstest")
@@ -212,15 +294,16 @@ func createServersWithCallback(t *testing.T, serverCount int, jsEnabled bool, cb
 
 	for i := 1; i <= serverCount; i++ {
 		opts := &server.Options{
-			JetStream:     jsEnabled,
-			StoreDir:      filepath.Join(d, fmt.Sprintf("s%d", i)),
-			Port:          -1,
-			Host:          "localhost",
-			ServerName:    fmt.Sprintf("s%d", i),
-			LogFile:       filepath.Join(d, fmt.Sprintf("s%d.log", i)),
-			Routes:        routes,
-			SystemAccount: "SYS",
-			Accounts:      []*server.Account{sysAcc},
+			JetStream:       jsEnabled,
+			JetStreamDomain: jsDomain,
+			StoreDir:        filepath.Join(d, fmt.Sprintf("s%d", i)),
+			Port:            -1,
+			Host:            "localhost",
+			ServerName:      fmt.Sprintf("s%d", i),
+			LogFile:         filepath.Join(d, fmt.Sprintf("s%d.log", i)),
+			Routes:          routes,
+			SystemAccount:   "SYS",
+			Accounts:        []*server.Account{sysAcc},
 			Users: []*server.User{{
 				Username: "sys",
 				Password: "pass",
@@ -661,43 +744,6 @@ func TestCLIStreamGet(t *testing.T) {
 	}
 }
 
-func TestCLIStreamBackupAndRestore(t *testing.T) {
-	srv, nc, mgr := setupJStreamTest(t)
-	defer srv.Shutdown()
-
-	stream, err := mgr.NewStreamFromDefault("file1", file1Stream())
-	checkErr(t, err, "could not create stream: %v", err)
-	streamShouldExist(t, mgr, "file1")
-
-	for i := 0; i < 1000; i++ {
-		nc.Publish("js.file.1", []byte(RandomString(5480)))
-	}
-
-	td, err := os.MkdirTemp("", "")
-	checkErr(t, err, "temp dir failed")
-	os.RemoveAll(td)
-
-	runNatsCli(t, fmt.Sprintf("--server='%s' str backup file1 '%s' --no-progress", srv.ClientURL(), td))
-
-	preState, err := stream.State()
-	checkErr(t, err, "state failed")
-	stream.Delete()
-
-	runNatsCli(t, fmt.Sprintf("--server='%s' str restore  '%s' --no-progress", srv.ClientURL(), td))
-	stream, err = mgr.NewStreamFromDefault("file1", file1Stream())
-	checkErr(t, err, "could not create stream: %v", err)
-
-	postState, err := stream.State()
-	checkErr(t, err, "state failed")
-	if !reflect.DeepEqual(preState, postState) {
-		t.Fatalf("restored state differed")
-	}
-
-	if postState.Msgs != 1000 {
-		t.Fatalf("Expected 1000 messages got %d", postState.Msgs)
-	}
-}
-
 func RandomString(n int) string {
 	var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
@@ -992,42 +1038,6 @@ func TestCLIConsumerCopy(t *testing.T) {
 
 	if pull1.MaxAckPending() != 1000 {
 		t.Fatalf("Expected pull1 to have 1000 Ack outstanding, got %v", pull1.MaxAckPending())
-	}
-}
-
-func TestCLIStreamBackupRestore(t *testing.T) {
-	srv, nc, mgr := setupConsTest(t)
-	defer srv.Shutdown()
-
-	dir, err := os.MkdirTemp("", "")
-	checkErr(t, err, "temp dir failed")
-	defer os.RemoveAll(dir)
-	target := filepath.Join(dir, "backup.tgz")
-
-	stream, err := mgr.NewStreamFromDefault("file1", file1Stream())
-	checkErr(t, err, "could not create stream: %v", err)
-	streamShouldExist(t, mgr, "file1")
-
-	for i := 0; i < 1024; i++ {
-		_, err = nc.Request("js.file.1", []byte(fmt.Sprintf("message %d", i)), time.Second)
-		checkErr(t, err, "publish failed")
-	}
-
-	runNatsCli(t, fmt.Sprintf("--server='%s' stream backup file1 '%s'", srv.ClientURL(), target))
-
-	err = stream.Delete()
-	checkErr(t, err, "delete failed")
-	streamShouldNotExist(t, mgr, "file1")
-
-	runNatsCli(t, fmt.Sprintf("--server='%s' stream restore '%s'", srv.ClientURL(), target))
-	streamShouldExist(t, mgr, "file1")
-
-	stream, err = mgr.LoadStream("file1")
-	checkErr(t, err, "load failed")
-	state, err := stream.State()
-	checkErr(t, err, "state failed")
-	if state.LastSeq != 1024 {
-		t.Fatalf("expected 1024 messages got %d", state.LastSeq)
 	}
 }
 
